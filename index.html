@@ -1,0 +1,654 @@
+
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+#gameCanvas { display: block; background: transparent; cursor: none; }
+#gameWrap {
+  position: relative; width: 100%; aspect-ratio: 16/9;
+  max-height: 520px; overflow: hidden; border-radius: 12px;
+  font-family: var(--font-mono, monospace); user-select: none;
+}
+#ui {
+  position: absolute; top: 10px; left: 0; right: 0;
+  display: flex; justify-content: space-between; align-items: flex-start;
+  padding: 0 16px; pointer-events: none; z-index: 10;
+}
+.ui-box {
+  background: rgba(0,20,50,0.75); border: 1px solid rgba(0,200,255,0.4);
+  border-radius: 8px; padding: 6px 14px; color: #7ef0ff;
+  font-size: 13px; font-family: var(--font-mono, monospace); line-height: 1.6;
+}
+.ui-val { color: #fff; font-weight: 500; }
+#overlay {
+  position: absolute; inset: 0; display: flex; flex-direction: column;
+  align-items: center; justify-content: center;
+  background: rgba(0,10,30,0.88); z-index: 20; color: #fff;
+  text-align: center; padding: 24px;
+}
+#overlay h2 { font-size: 28px; color: #7ef0ff; margin-bottom: 12px; letter-spacing: 2px; }
+#overlay p { font-size: 14px; color: #aac; margin-bottom: 6px; line-height: 1.6; }
+.score-display { font-size: 22px; color: #fff; margin: 14px 0; }
+#startBtn {
+  margin-top: 18px; background: transparent;
+  border: 1.5px solid #7ef0ff; color: #7ef0ff;
+  padding: 10px 32px; font-size: 15px; border-radius: 8px;
+  cursor: pointer; font-family: var(--font-mono, monospace);
+  letter-spacing: 1px; transition: background 0.2s, color 0.2s;
+}
+#startBtn:hover { background: rgba(0,200,255,0.15); color: #fff; }
+#depthBar {
+  position: absolute; right: 14px; top: 50%; transform: translateY(-50%);
+  width: 10px; height: 55%; background: rgba(0,20,50,0.6);
+  border: 1px solid rgba(0,200,255,0.3); border-radius: 5px;
+  overflow: hidden; z-index: 10;
+}
+#depthFill {
+  position: absolute; bottom: 0; left: 0; right: 0;
+  background: linear-gradient(to top, #00bfff, #7ef0ff);
+  transition: height 0.1s; border-radius: 5px;
+}
+</style>
+
+<div id="gameWrap">
+  <canvas id="gameCanvas"></canvas>
+  <div id="ui">
+    <div class="ui-box">
+      DEPTH <span class="ui-val" id="depthVal">0</span>m<br>
+      TIME <span class="ui-val" id="timeVal">90</span>s
+    </div>
+    <div class="ui-box">
+      HULL <span class="ui-val" id="livesVal">♦♦♦</span><br>
+      SCORE <span class="ui-val" id="scoreVal">0</span>
+    </div>
+  </div>
+  <div id="depthBar"><div id="depthFill" style="height:0%"></div></div>
+  <div id="overlay">
+    <h2>🌊 DIVE TO THE TITANIC</h2>
+    <p>Navigate your submarine to the Titanic wreck at <strong>3,800m</strong></p>
+    <p>↑ / ↓ to move vertically &nbsp;|&nbsp; → to dive faster &nbsp;|&nbsp; ← to brake</p>
+    <p style="color:#f0a060">⭐ Starfish &nbsp;&nbsp; 🐟 Fish &nbsp;&nbsp; 🥒 Sea Cucumbers</p>
+    <p style="color:#ff8080">⚠ Avoid the seabed — sustained contact damages the hull</p>
+    <button id="startBtn" onclick="startGame()">DIVE NOW</button>
+  </div>
+</div>
+
+<script>
+const wrap = document.getElementById('gameWrap');
+const canvas = document.getElementById('gameCanvas');
+const ctx = canvas.getContext('2d');
+const overlay = document.getElementById('overlay');
+
+let W, H, scale;
+let keys = {};
+let gameState = 'menu';
+let sub, obstacles, particles, depth, timer, score, lives, gameTime, exploding;
+let seabedContactTime = 0;
+let lastSeabedDamage = 0;
+let winState = null; // null | 'fanfare' | 'exploding'
+let fanfareTimer = 0;
+let fanfareStars = [];
+let lastTime = 0;
+
+function resize() {
+  const rect = wrap.getBoundingClientRect();
+  W = rect.width; H = rect.height || W * 9/16;
+  canvas.width = W; canvas.height = H;
+  scale = W / 800;
+}
+resize();
+window.addEventListener('resize', resize);
+
+document.addEventListener('keydown', e => {
+  keys[e.key] = true;
+  if (['ArrowUp','ArrowDown','ArrowLeft','ArrowRight','w','s','a','d'].includes(e.key) && gameState === 'playing') e.preventDefault();
+});
+document.addEventListener('keyup', e => { keys[e.key] = false; });
+
+wrap.addEventListener('touchstart', e => {
+  if (gameState !== 'playing') return;
+  const r = wrap.getBoundingClientRect();
+  for (let t of e.touches) {
+    const x = t.clientX - r.left, y = t.clientY - r.top;
+    if (x < W/2) { if (y < H/2) keys['ArrowUp'] = true; else keys['ArrowDown'] = true; }
+    else keys['ArrowRight'] = true;
+  }
+  e.preventDefault();
+}, { passive: false });
+wrap.addEventListener('touchend', e => {
+  keys['ArrowUp'] = false; keys['ArrowDown'] = false;
+  keys['ArrowRight'] = false; keys['ArrowLeft'] = false;
+  e.preventDefault();
+}, { passive: false });
+
+function startGame() {
+  overlay.style.display = 'none';
+  gameState = 'playing';
+  depth = 0; timer = 90; score = 0; lives = 3;
+  gameTime = 0; exploding = false;
+  seabedContactTime = 0; lastSeabedDamage = 0;
+  winState = null; fanfareTimer = 0; fanfareStars = [];
+  obstacles = []; particles = [];
+  sub = { x: 100*scale, y: H/2, vx: 0, vy: 0, w: 64*scale, h: 22*scale, hit: false, hitTimer: 0, angle: 0 };
+  lastTime = performance.now();
+  requestAnimationFrame(loop);
+}
+
+function spawnObstacle() {
+  const roll = Math.random();
+  const type = roll < 0.35 ? 'fish' : roll < 0.70 ? 'cucumber' : 'starfish';
+  const s = scale;
+  if (type === 'fish') return {
+    type, x: W+60, y: Math.random()*H*0.85+H*0.05,
+    vx: -(1.8+Math.random()*1.5)*s, vy: (Math.random()-0.5)*1.2*s,
+    r: 18*s, angle: 0, spin: (Math.random()-0.5)*0.15
+  };
+  if (type === 'cucumber') {
+    const goRight = Math.random()>0.5;
+    return {
+      type, x: goRight ? -60 : W+60, y: Math.random()*H*0.85+H*0.05,
+      vx: goRight?(1.5+Math.random()*1.2)*s:-(1.5+Math.random()*1.2)*s, vy: 0,
+      r: 20*s, angle: goRight?0:Math.PI, spin: (Math.random()-0.5)*0.06
+    };
+  }
+  const edgeRoll = Math.random();
+  let sx, sy;
+  if (edgeRoll < 0.5) { sx = W+40+Math.random()*60; sy = H*0.5+Math.random()*H*0.5; }
+  else { sx = W*0.4+Math.random()*W*0.6; sy = H+40+Math.random()*40; }
+  const tx = Math.random()*W*0.35, ty = Math.random()*H*0.35;
+  const dx = tx-sx, dy = ty-sy, dist = Math.sqrt(dx*dx+dy*dy);
+  const speed = (2.8+Math.random()*2.5)*s;
+  return {
+    type, x: sx, y: sy,
+    vx: (dx/dist)*speed, vy: (dy/dist)*speed,
+    r: 20*s, angle: 0,
+    spin: (Math.random()-0.5)*0.28+(Math.random()>0.5?0.12:-0.12),
+    wobbleAmp: (0.3+Math.random()*0.7)*s,
+    wobbleFreq: 1.5+Math.random()*3,
+    wobblePhase: Math.random()*Math.PI*2,
+    accel: Math.random()<0.4?0.004*s:0,
+    dangerous: true
+  };
+}
+
+function spawnParticle(x, y, color, vx, vy, count) {
+  for (let i = 0; i < (count||10); i++) {
+    particles.push({
+      x, y,
+      vx: (vx||0)*0.3+(Math.random()-0.5)*4,
+      vy: (vy||0)*0.3+(Math.random()-0.5)*4,
+      life: 1, decay: 0.03+Math.random()*0.03,
+      r: 2+Math.random()*5, color
+    });
+  }
+}
+
+function seabedY(x) {
+  return H*0.9 + Math.sin(x*0.02 + gameTime*0.2)*10*scale;
+}
+
+// Dismiss all enemies with a scatter animation toward the deep
+function scatterEnemies() {
+  obstacles.forEach(o => {
+    o.scattering = true;
+    // dive down and away from sub
+    o.vx = (Math.random()-0.3)*4*scale;
+    o.vy = (2+Math.random()*4)*scale;
+    o.spin = (Math.random()-0.5)*0.5;
+    o.fadeOut = 1;
+    o.fadeDecay = 0.012 + Math.random()*0.015;
+  });
+}
+
+function spawnFanfareStar(x, y) {
+  const angle = Math.random()*Math.PI*2;
+  const speed = (3+Math.random()*6)*scale;
+  fanfareStars.push({
+    x, y,
+    vx: Math.cos(angle)*speed, vy: Math.sin(angle)*speed,
+    life: 1, decay: 0.01+Math.random()*0.015,
+    r: (4+Math.random()*8)*scale,
+    color: ['#ffcc00','#ff8800','#ffffff','#7ef0ff','#ff44aa'][Math.floor(Math.random()*5)],
+    rotate: Math.random()*Math.PI*2,
+    spin: (Math.random()-0.5)*0.2
+  });
+}
+
+function loop(ts) {
+  if (gameState !== 'playing' && gameState !== 'exploding' && gameState !== 'fanfare') return;
+  const dt = Math.min((ts-lastTime)/1000, 0.05);
+  lastTime = ts;
+
+  // FANFARE STATE
+  if (winState === 'fanfare') {
+    fanfareTimer += dt;
+    // Scatter enemies — fade them out
+    obstacles.forEach(o => {
+      if (o.scattering) {
+        o.x += o.vx; o.y += o.vy;
+        o.angle += o.spin;
+        o.fadeOut = Math.max(0, (o.fadeOut||1) - o.fadeDecay);
+      }
+    });
+    obstacles = obstacles.filter(o => (o.fadeOut||0) > 0);
+
+    // Burst fanfare stars from center
+    if (fanfareTimer < 1.5 && Math.random() < dt*40) {
+      spawnFanfareStar(W*0.45 + (Math.random()-0.5)*W*0.3, H*0.5 + (Math.random()-0.5)*H*0.3);
+    }
+    fanfareStars.forEach(s => {
+      s.x += s.vx; s.y += s.vy; s.vy += 0.08;
+      s.life -= s.decay; s.r *= 0.985; s.rotate += s.spin;
+    });
+    fanfareStars = fanfareStars.filter(s => s.life > 0);
+
+    particles.forEach(p => { p.x+=p.vx; p.y+=p.vy; p.vy+=0.05; p.life-=p.decay; p.r*=0.97; });
+    particles = particles.filter(p => p.life>0);
+
+    if (fanfareTimer >= 2.2 && winState === 'fanfare') {
+      winState = 'exploding';
+      triggerExplosion('win');
+    }
+    draw();
+    requestAnimationFrame(loop);
+    return;
+  }
+
+  if (!exploding) {
+    gameTime += dt; timer -= dt;
+
+    const maxVy=320*scale, accelY=900*scale, accelX=500*scale;
+    if (keys['ArrowUp']||keys['w']||keys['W']) sub.vy -= accelY*dt;
+    if (keys['ArrowDown']||keys['s']||keys['S']) sub.vy += accelY*dt;
+    if (keys['ArrowRight']||keys['d']||keys['D']) sub.vx += accelX*dt;
+    if (keys['ArrowLeft']||keys['a']||keys['A']) sub.vx -= accelX*dt;
+    sub.vy = Math.max(-maxVy, Math.min(maxVy, sub.vy));
+    sub.vx = Math.max(-maxVy*0.5, Math.min(180*scale, sub.vx));
+    sub.vy *= 0.86; sub.vx *= 0.90;
+    sub.x += sub.vx*dt; sub.y += sub.vy*dt;
+    sub.x = Math.max(40*scale, Math.min(W*0.55, sub.x));
+
+    // Seabed collision — continuous damage
+    const sbyAtSub = seabedY(sub.x);
+    const subBottom = sub.y + sub.h*0.5;
+    if (subBottom >= sbyAtSub - 2) {
+      // Push sub up off seabed
+      sub.y = sbyAtSub - sub.h*0.5 - 2;
+      sub.vy = Math.min(sub.vy, -60*scale);
+      seabedContactTime += dt;
+      // Damage every 1 second of contact
+      if (seabedContactTime - lastSeabedDamage >= 1.0) {
+        lives--;
+        lastSeabedDamage = seabedContactTime;
+        sub.hit = true; sub.hitTimer = 0.5;
+        // Scrape sparks
+        for (let i = 0; i < 12; i++) {
+          spawnParticle(
+            sub.x + (Math.random()-0.5)*sub.w,
+            sbyAtSub,
+            ['#ff8800','#ffcc00','#ff4400'][Math.floor(Math.random()*3)],
+            (Math.random()-0.5)*3, -Math.random()*3, 1
+          );
+        }
+      }
+    } else {
+      seabedContactTime = 0; lastSeabedDamage = 0;
+    }
+
+    // Ceiling
+    sub.y = Math.max(sub.h*0.5+4, sub.y);
+
+    const targetAngle = Math.atan2(sub.vy*0.004,1)*0.6;
+    sub.angle += (targetAngle-sub.angle)*0.12;
+
+    const speedBonus = Math.max(0, sub.vx)/(180*scale);
+    depth = Math.round(gameTime*38*(1+speedBonus*0.8));
+    score = depth;
+  }
+
+  // Spawn enemies (only when not in win state)
+  if (!winState) {
+    const spawnRate = Math.max(0.25, 1.4-gameTime*0.008);
+    if (Math.random() < dt/spawnRate) { const o = spawnObstacle(); if (o) obstacles.push(o); }
+    if (depth>1500 && Math.random()<dt*0.3) { const o = spawnObstacle(); if (o && o.type==='starfish') obstacles.push(o); }
+  }
+
+  // Move obstacles
+  obstacles.forEach(o => {
+    if (o.scattering) return;
+    if (o.type==='starfish') {
+      const mag = Math.sqrt(o.vx*o.vx+o.vy*o.vy)||1;
+      const perpX = -o.vy/mag, perpY = o.vx/mag;
+      const wobble = Math.sin(gameTime*(o.wobbleFreq||2)+(o.wobblePhase||0))*(o.wobbleAmp||0);
+      o.x += (o.vx+perpX*wobble)*dt*60; o.y += (o.vy+perpY*wobble)*dt*60;
+      if (o.accel) { const m=Math.sqrt(o.vx*o.vx+o.vy*o.vy); o.vx+=(o.vx/m)*o.accel; o.vy+=(o.vy/m)*o.accel; }
+    } else { o.x += o.vx; o.y += o.vy; }
+    o.angle += o.spin;
+  });
+  obstacles = obstacles.filter(o => o.scattering || (o.x>-120&&o.x<W+120&&o.y>-120&&o.y<H+120));
+
+  // Hit detection
+  if (!exploding && !sub.hit && !winState) {
+    const sw=sub.w*0.38, sh=sub.h*0.36;
+    for (let o of obstacles) {
+      if (o.scattering) continue;
+      const dx=o.x-sub.x, dy=o.y-sub.y;
+      const hitR = o.type==='starfish'?o.r*0.75:o.r*0.65;
+      if (Math.abs(dx)<sw+hitR&&Math.abs(dy)<sh+hitR) {
+        lives--;
+        sub.hit=true; sub.hitTimer=0.7;
+        spawnParticle(o.x, o.y, o.type==='starfish'?'#ff3060':'#ff8040', o.vx, o.vy);
+        if (o.type==='starfish') { sub.vx-=200*scale; sub.vy+=(Math.random()-0.5)*300*scale; }
+        obstacles=obstacles.filter(ob=>ob!==o);
+        break;
+      }
+    }
+  }
+
+  if (sub.hit) { sub.hitTimer-=dt; if (sub.hitTimer<=0) sub.hit=false; }
+
+  // Win condition: reach titanic
+  if (depth>=3800&&!exploding&&!winState) {
+    winState='fanfare';
+    gameState='fanfare';
+    fanfareTimer=0;
+    scatterEnemies();
+    // Big burst of celebration particles
+    for (let i=0;i<60;i++) {
+      spawnFanfareStar(sub.x+(Math.random()-0.5)*100*scale, sub.y+(Math.random()-0.5)*60*scale);
+    }
+  }
+
+  // Lose conditions
+  if ((timer<=0||lives<=0)&&!exploding&&!winState) triggerExplosion('lose');
+
+  particles.forEach(p=>{p.x+=p.vx;p.y+=p.vy;p.vy+=0.05;p.life-=p.decay;p.r*=0.97;});
+  particles=particles.filter(p=>p.life>0);
+
+  document.getElementById('depthVal').textContent=depth;
+  document.getElementById('timeVal').textContent=Math.max(0,Math.ceil(timer));
+  document.getElementById('scoreVal').textContent=score;
+  document.getElementById('livesVal').textContent=['♦♦♦','♦♦◇','♦◇◇','◇◇◇'][Math.max(0,3-lives)];
+  document.getElementById('depthFill').style.height=Math.min(100,depth/3800*100)+'%';
+
+  draw();
+  requestAnimationFrame(loop);
+}
+
+let explodeTimer=0;
+function triggerExplosion(reason) {
+  exploding=true; gameState='exploding'; explodeTimer=0;
+  for (let i=0;i<50;i++) {
+    const a=Math.random()*Math.PI*2, spd=1.5+Math.random()*6;
+    particles.push({
+      x:sub.x,y:sub.y,vx:Math.cos(a)*spd,vy:Math.sin(a)*spd,
+      life:1,decay:0.015+Math.random()*0.02,
+      r:5+Math.random()*10,
+      color:['#ff8800','#ff4400','#ffcc00','#ff6600','#ffffff'][Math.floor(Math.random()*5)]
+    });
+  }
+  setTimeout(()=>{gameState='menu';showEndScreen(reason);},2800);
+}
+
+function showEndScreen(reason) {
+  const h2=overlay.querySelector('h2');
+  const p1=overlay.querySelector('p');
+  overlay.style.display='flex';
+  if (reason==='win') {
+    h2.textContent='💥 THE TITANIC!'; h2.style.color='#ffcc44';
+    p1.innerHTML=`You reached the wreck at <strong>${depth}m</strong> — the hull imploded on contact.`;
+  } else {
+    h2.textContent=lives<=0?'💀 HULL BREACH':'⏰ TIME EXPIRED'; h2.style.color='#ff6060';
+    p1.innerHTML=`You reached <strong>${depth}m</strong> before the end.`;
+  }
+  document.querySelectorAll('.score-display').forEach(e=>e.remove());
+  const sd=document.createElement('div'); sd.className='score-display';
+  sd.textContent=`Final depth: ${depth}m`;
+  overlay.insertBefore(sd,overlay.querySelector('#startBtn'));
+  overlay.querySelector('#startBtn').textContent='DIVE AGAIN';
+}
+
+function drawSub(x,y,hit,angle) {
+  const s=scale;
+  ctx.save(); ctx.translate(x,y); ctx.rotate(angle);
+  if (hit) ctx.globalAlpha=0.45+0.55*Math.abs(Math.sin(Date.now()*0.025));
+  if (!exploding&&Math.random()<0.4) {
+    particles.push({
+      x:x-(34+Math.abs(sub.vx)*0.01)*s, y:y+(Math.random()-0.5)*10*s,
+      vx:-(0.6+Math.random()*0.8+Math.abs(sub.vx)*0.003)*s,
+      vy:-(0.2+Math.random()*0.4)*s,
+      life:1,decay:0.035,r:(1.5+Math.random()*3)*s,
+      color:'rgba(160,232,255,0.6)',bubble:true
+    });
+  }
+  ctx.beginPath(); ctx.ellipse(0,0,32*s,11*s,0,0,Math.PI*2);
+  ctx.fillStyle='#2a7fbf'; ctx.fill();
+  ctx.strokeStyle='#7ef0ff'; ctx.lineWidth=1.5*s; ctx.stroke();
+  ctx.beginPath(); ctx.roundRect(-6*s,-18*s,14*s,12*s,3*s);
+  ctx.fillStyle='#1a5a90'; ctx.fill();
+  ctx.strokeStyle='#7ef0ff'; ctx.lineWidth=1.2*s; ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(4*s,-18*s); ctx.lineTo(4*s,-26*s); ctx.lineTo(10*s,-26*s);
+  ctx.strokeStyle='#7ef0ff'; ctx.lineWidth=2*s; ctx.stroke();
+  ctx.beginPath(); ctx.arc(6*s,0,5*s,0,Math.PI*2);
+  ctx.fillStyle=hit?'#ff4040':'#a0e8ff'; ctx.fill();
+  ctx.strokeStyle='#7ef0ff'; ctx.lineWidth=1.2*s; ctx.stroke();
+  for (let i=0;i<3;i++) {
+    ctx.save(); ctx.translate(-32*s,0);
+    ctx.rotate(i*Math.PI*2/3+gameTime*8*(1+Math.abs(sub.vx)*0.002));
+    ctx.beginPath(); ctx.ellipse(0,6*s,3*s,8*s,0.3,0,Math.PI*2);
+    ctx.fillStyle='#5599cc'; ctx.fill(); ctx.restore();
+  }
+  ctx.restore();
+}
+
+function drawFish(x,y,r,angle) {
+  ctx.save(); ctx.translate(x,y); ctx.rotate(angle+Math.PI);
+  ctx.beginPath(); ctx.ellipse(0,0,r*1.2,r*0.65,0,0,Math.PI*2);
+  ctx.fillStyle='#f0a060'; ctx.fill();
+  ctx.beginPath(); ctx.moveTo(r*1.1,0); ctx.lineTo(r*1.8,-r*0.6); ctx.lineTo(r*1.8,r*0.6);
+  ctx.closePath(); ctx.fillStyle='#e07030'; ctx.fill();
+  ctx.beginPath(); ctx.arc(-r*0.45,-r*0.1,r*0.22,0,Math.PI*2);
+  ctx.fillStyle='#222'; ctx.fill(); ctx.restore();
+}
+
+function drawStarfish(x,y,r,angle,dangerous,alpha) {
+  ctx.save(); ctx.translate(x,y); ctx.rotate(angle);
+  if (alpha!==undefined) ctx.globalAlpha=alpha;
+  if (dangerous) {
+    ctx.beginPath(); ctx.arc(0,0,r*1.4,0,Math.PI*2);
+    ctx.fillStyle='rgba(255,40,80,0.12)'; ctx.fill();
+  }
+  ctx.beginPath();
+  for (let i=0;i<5;i++) {
+    const a1=(i*2*Math.PI/5)-Math.PI/2, a2=a1+Math.PI/5;
+    ctx.lineTo(Math.cos(a1)*r,Math.sin(a1)*r);
+    ctx.lineTo(Math.cos(a2)*r*0.4,Math.sin(a2)*r*0.4);
+  }
+  ctx.closePath(); ctx.fillStyle=dangerous?'#ff1a4a':'#e04060'; ctx.fill();
+  ctx.strokeStyle='#ff80a0'; ctx.lineWidth=dangerous?2:1.5; ctx.stroke();
+  if (dangerous) { ctx.beginPath(); ctx.arc(0,0,r*0.35,0,Math.PI*2); ctx.fillStyle='#ff6090'; ctx.fill(); }
+  ctx.restore();
+}
+
+function drawCucumber(x,y,r,angle,alpha) {
+  ctx.save(); ctx.translate(x,y); ctx.rotate(angle);
+  if (alpha!==undefined) ctx.globalAlpha=alpha;
+  ctx.beginPath(); ctx.ellipse(0,0,r*1.6,r*0.5,0,0,Math.PI*2);
+  ctx.fillStyle='#3a9a5a'; ctx.fill(); ctx.strokeStyle='#60cc80'; ctx.lineWidth=1.5; ctx.stroke();
+  for (let i=-3;i<=3;i++) {
+    ctx.beginPath(); ctx.moveTo(i*r*0.45,-r*0.5); ctx.lineTo(i*r*0.45,-r*0.9);
+    ctx.strokeStyle='#60cc80'; ctx.lineWidth=1.5; ctx.stroke();
+  }
+  ctx.restore();
+}
+
+function drawTitanic(progress) {
+  if (progress<0.7) return;
+  const alpha=Math.min(1,(progress-0.7)/0.3);
+  const tx=W*0.65, ty=H*0.82, s=scale*0.8;
+  ctx.save(); ctx.globalAlpha=alpha; ctx.translate(tx,ty);
+  ctx.beginPath(); ctx.moveTo(-120*s,0); ctx.lineTo(-140*s,40*s); ctx.lineTo(140*s,40*s); ctx.lineTo(120*s,0);
+  ctx.closePath(); ctx.fillStyle='#443322'; ctx.fill(); ctx.strokeStyle='#776655'; ctx.lineWidth=2*s; ctx.stroke();
+  ctx.beginPath(); ctx.rect(-120*s,-10*s,240*s,10*s); ctx.fillStyle='#332211'; ctx.fill();
+  [-50,-15,20,55].forEach(fx=>{
+    ctx.beginPath(); ctx.rect(fx*s-6*s,-55*s,12*s,45*s); ctx.fillStyle='#221100'; ctx.fill();
+    ctx.beginPath(); ctx.rect(fx*s-8*s,-60*s,16*s,8*s); ctx.fillStyle='#1a0d00'; ctx.fill();
+    ctx.fillStyle='rgba(120,50,10,0.5)'; ctx.fillRect(fx*s-5*s,-30*s,10*s,20*s);
+  });
+  ctx.beginPath(); ctx.rect(-60*s,-35*s,120*s,25*s); ctx.fillStyle='#2a1a0a'; ctx.fill();
+  ctx.fillStyle='rgba(255,200,100,0.8)'; ctx.font=`${10*s}px monospace`; ctx.textAlign='center';
+  ctx.fillText('R.M.S. TITANIC',0,20*s);
+  ctx.strokeStyle='rgba(150,80,20,0.4)'; ctx.lineWidth=2*s;
+  [-80,-40,0,40,80].forEach(rx=>{ctx.beginPath();ctx.moveTo(rx*s,-10*s);ctx.lineTo(rx*s+10*s,40*s);ctx.stroke();});
+  ctx.restore();
+}
+
+function drawFanfareStar(s) {
+  ctx.save(); ctx.translate(s.x,s.y); ctx.rotate(s.rotate); ctx.globalAlpha=s.life*0.9;
+  ctx.beginPath();
+  for (let i=0;i<5;i++) {
+    const a1=(i*2*Math.PI/5)-Math.PI/2, a2=a1+Math.PI/5;
+    ctx.lineTo(Math.cos(a1)*s.r,Math.sin(a1)*s.r);
+    ctx.lineTo(Math.cos(a2)*s.r*0.4,Math.sin(a2)*s.r*0.4);
+  }
+  ctx.closePath(); ctx.fillStyle=s.color; ctx.fill(); ctx.restore();
+}
+
+function draw() {
+  const depthPct=Math.min(1,depth/4000);
+  const grad=ctx.createLinearGradient(0,0,0,H);
+  grad.addColorStop(0,`rgb(0,${Math.round(30-depthPct*20)},${Math.round(80-depthPct*50)})`);
+  grad.addColorStop(1,`rgb(0,${Math.round(10-depthPct*8)},${Math.round(40-depthPct*25)})`);
+  ctx.fillStyle=grad; ctx.fillRect(0,0,W,H);
+
+  if (depthPct<0.3) {
+    ctx.save(); ctx.globalAlpha=(1-depthPct/0.3)*0.06;
+    for (let i=0;i<8;i++) {
+      const lx=(i/8)*W+Math.sin(gameTime*0.3+i)*40;
+      ctx.beginPath(); ctx.moveTo(lx,0); ctx.lineTo(lx-30,H*0.4);
+      ctx.strokeStyle='#a0e8ff'; ctx.lineWidth=18; ctx.stroke();
+    }
+    ctx.restore();
+  }
+
+  // Seabed with danger glow if sub is close
+  const subBottom=sub.y+sub.h*0.5;
+  const sbyNow=seabedY(sub.x);
+  const nearBottom=subBottom>sbyNow-40*scale;
+  if (nearBottom&&!winState) {
+    ctx.save();
+    const dangerAlpha=Math.min(0.5,(1-(sbyNow-subBottom)/(40*scale)))*0.6;
+    ctx.globalAlpha=dangerAlpha*(0.5+0.5*Math.sin(gameTime*8));
+    const seaGlow=ctx.createLinearGradient(0,sbyNow-30*scale,0,sbyNow);
+    seaGlow.addColorStop(0,'rgba(255,80,0,0)');
+    seaGlow.addColorStop(1,'rgba(255,80,0,0.8)');
+    ctx.fillStyle=seaGlow; ctx.fillRect(0,sbyNow-30*scale,W,30*scale);
+    ctx.restore();
+  }
+  // Seabed damage timer bar — show when in contact
+  if (seabedContactTime>0&&seabedContactTime>lastSeabedDamage&&!winState) {
+    const progress=(seabedContactTime-lastSeabedDamage)/1.0;
+    const bx=sub.x-30*scale, by=sbyNow+4*scale, bw=60*scale, bh=5*scale;
+    ctx.save(); ctx.globalAlpha=0.85;
+    ctx.fillStyle='rgba(0,0,0,0.5)'; ctx.beginPath(); ctx.roundRect(bx,by,bw,bh,2); ctx.fill();
+    ctx.fillStyle='#ff6600'; ctx.beginPath(); ctx.roundRect(bx,by,bw*progress,bh,2); ctx.fill();
+    ctx.restore();
+  }
+
+  ctx.fillStyle='#1a0d00';
+  ctx.beginPath(); ctx.moveTo(0,H*0.9);
+  for (let x=0;x<=W;x+=40) ctx.lineTo(x,seabedY(x));
+  ctx.lineTo(W,H); ctx.lineTo(0,H); ctx.closePath(); ctx.fill();
+
+  drawTitanic(depth/3800);
+
+  // Starfish trails
+  obstacles.forEach(o=>{
+    if (o.type==='starfish'&&o.dangerous&&!o.scattering) {
+      ctx.save();
+      const spd=Math.sqrt(o.vx*o.vx+o.vy*o.vy)||1;
+      const nx=-o.vx/spd, ny=-o.vy/spd;
+      const g=ctx.createLinearGradient(o.x,o.y,o.x+nx*60,o.y+ny*60);
+      g.addColorStop(0,'rgba(255,30,80,0.35)'); g.addColorStop(1,'rgba(255,30,80,0)');
+      ctx.strokeStyle=g; ctx.lineWidth=o.r*1.2; ctx.lineCap='round';
+      ctx.beginPath(); ctx.moveTo(o.x,o.y); ctx.lineTo(o.x+nx*60,o.y+ny*60); ctx.stroke(); ctx.restore();
+    }
+  });
+
+  // Particles
+  particles.forEach(p=>{
+    ctx.save(); ctx.globalAlpha=p.life*(p.bubble?0.5:0.9);
+    ctx.beginPath(); ctx.arc(p.x,p.y,Math.max(0.1,p.r),0,Math.PI*2);
+    if (p.bubble) { ctx.strokeStyle='rgba(200,240,255,0.8)'; ctx.lineWidth=1; ctx.stroke(); }
+    else { ctx.fillStyle=p.color; ctx.fill(); }
+    ctx.restore();
+  });
+
+  // Obstacles (with fade for scattering ones)
+  obstacles.forEach(o=>{
+    const a=o.scattering?(o.fadeOut||0):1;
+    if (a<=0) return;
+    if (o.type==='fish') { ctx.save(); ctx.globalAlpha=a; drawFish(o.x,o.y,o.r,o.angle); ctx.restore(); }
+    else if (o.type==='starfish') drawStarfish(o.x,o.y,o.r,o.angle,o.dangerous,a);
+    else drawCucumber(o.x,o.y,o.r,o.angle,a);
+  });
+
+  // Fanfare stars
+  fanfareStars.forEach(s=>drawFanfareStar(s));
+
+  // Fanfare text
+  if (winState==='fanfare') {
+    const t=fanfareTimer;
+    const pulse=1+0.06*Math.sin(t*10);
+    ctx.save();
+    ctx.globalAlpha=Math.min(1,t*3)*0.95;
+    ctx.textAlign='center'; ctx.font=`bold ${Math.round(32*scale*pulse)}px monospace`;
+    ctx.fillStyle='#ffcc00';
+    ctx.fillText('TITANIC FOUND!', W/2, H*0.38);
+    if (t>0.4) {
+      ctx.font=`${Math.round(16*scale)}px monospace`;
+      ctx.fillStyle='#ffffff'; ctx.globalAlpha=Math.min(1,(t-0.4)*3)*0.85;
+      ctx.fillText('Brace for implosion...', W/2, H*0.38+30*scale);
+    }
+    ctx.restore();
+  }
+
+  // Sub
+  if (!exploding||particles.length>15) drawSub(sub.x,sub.y,sub.hit,sub.angle);
+
+  // Speed bar
+  if (!exploding&&gameState==='playing') {
+    const bw=60*scale, bh=6*scale;
+    const bx=sub.x-bw/2, by=sub.y+sub.h+10*scale;
+    ctx.save(); ctx.globalAlpha=0.55;
+    ctx.fillStyle='rgba(0,20,50,0.6)'; ctx.beginPath(); ctx.roundRect(bx,by,bw,bh,3*scale); ctx.fill();
+    const fw=Math.max(0,(sub.vx/(180*scale))*bw);
+    if (fw>0) { ctx.fillStyle='#7ef0ff'; ctx.beginPath(); ctx.roundRect(bx,by,fw,bh,3*scale); ctx.fill(); }
+    ctx.restore();
+  }
+
+  // Depth line
+  ctx.save(); ctx.globalAlpha=0.12; ctx.strokeStyle='#7ef0ff'; ctx.lineWidth=1; ctx.setLineDash([6,8]);
+  ctx.beginPath(); ctx.moveTo(sub.x+sub.w/2+8,sub.y); ctx.lineTo(W*0.88,sub.y); ctx.stroke(); ctx.restore();
+
+  // Depth label
+  ctx.save(); ctx.font=`${11*scale}px monospace`; ctx.fillStyle='rgba(126,240,255,0.6)'; ctx.textAlign='right';
+  ctx.fillText(`${depth}m`,W*0.86,sub.y-4*scale); ctx.restore();
+
+  // Titanic proximity
+  if (depth>3400&&depth<3800&&!exploding&&!winState) {
+    ctx.save(); ctx.globalAlpha=0.5+0.5*Math.sin(gameTime*5);
+    ctx.font=`bold ${14*scale}px monospace`; ctx.fillStyle='#ffcc44'; ctx.textAlign='center';
+    ctx.fillText('⚠ TITANIC DETECTED — BRACE FOR IMPACT',W/2,48*scale); ctx.restore();
+  }
+
+  // Explosion flash
+  if (exploding) {
+    explodeTimer+=0.04;
+    if (explodeTimer<0.4) {
+      ctx.globalAlpha=Math.max(0,(0.4-explodeTimer)*2)*0.9;
+      ctx.fillStyle='#ffffff'; ctx.fillRect(0,0,W,H); ctx.globalAlpha=1;
+    }
+  }
+}
+
+ctx.fillStyle='#001430'; ctx.fillRect(0,0,canvas.width,canvas.height);
+</script>
